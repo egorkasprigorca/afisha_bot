@@ -62,20 +62,42 @@ pub async fn init_db(pool: &SqlitePool) {
 pub async fn insert_user(pool: &SqlitePool, user: User) {
     let mut tx = pool.begin().await.unwrap();
 
-    let result = sqlx::query(
-        "
-        INSERT INTO users (tg_id, city, tags, notification_time, events_interval)
-        VALUES ($1, $2, $3, $4, $5)
-        ",
-    )
-    .bind(serde_json::to_string(&user.tg_id).unwrap())
-    .bind(user.city)
-    .bind(serde_json::to_string(&user.tags).unwrap())
-    .bind(user.notification_time)
-    .bind(user.events_interval)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
+    let old_user = get_user(pool, user.tg_id).await;
+    match old_user {
+        Some(old_user) => {
+            let tg_id = old_user.tg_id.clone();
+            update_user(
+                pool,
+                UserFilter {
+                    id: Some(user.id),
+                    tg_id: Some(user.tg_id),
+                    city: Some(user.city),
+                    tags: Some(user.tags),
+                    notification_time: Some(user.notification_time),
+                    events_interval: Some(user.events_interval),
+                },
+                tg_id,
+            )
+            .await
+            .unwrap();
+        }
+        None => {
+            let result = sqlx::query(
+                "
+                INSERT INTO users (tg_id, city, tags, notification_time, events_interval)
+                VALUES ($1, $2, $3, $4, $5)
+                ",
+            )
+            .bind(serde_json::to_string(&user.tg_id).unwrap())
+            .bind(user.city)
+            .bind(serde_json::to_string(&user.tags).unwrap())
+            .bind(user.notification_time)
+            .bind(user.events_interval)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+    }
 
     tx.commit().await.unwrap();
 }
@@ -152,9 +174,11 @@ pub async fn get_all_users(pool: &SqlitePool) -> Option<Vec<User>> {
 pub async fn update_user(
     pool: &SqlitePool,
     values: UserFilter,
-    old_user: User,
+    tg_id: u64
 ) -> Result<(), sqlx::Error> {
     let mut conn = pool.acquire().await?;
+
+    let old_user = get_user(pool, tg_id).await.unwrap();
 
     let id_insert = old_user.id;
     let tg_id_insert: i64 = match values.tg_id {
@@ -180,12 +204,12 @@ pub async fn update_user(
 
     let result = sqlx::query(
         "
-        UPDATE profiles SET id = $1, tg_id = $2, city = $3, tags = $4, notification_time = $5, events_interval = $6
-        WHERE id = $1
+        UPDATE users SET tg_id = $1, city = $2, tags = $3, notification_time = $4, events_interval = $5
+        WHERE tg_id = $1
         "
     )
-    .bind(id_insert)
     .bind(tg_id_insert)
+    .bind(city_insert)
     .bind(serde_json::to_string(&tags_insert).unwrap())
     .bind(notification_time_insert)
     .bind(events_interval_insert)

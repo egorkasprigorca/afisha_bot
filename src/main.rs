@@ -18,7 +18,7 @@ use teloxide::{
         UpdateHandler,
     },
     prelude::*,
-    utils::{command::BotCommands, html, markdown},
+    utils::{command::BotCommands, html, markdown}, types::{InlineKeyboardMarkup, KeyboardMarkup, KeyboardButton},
 };
 use tokio::time;
 
@@ -31,14 +31,16 @@ mod db;
     description = "These commands are supported:"
 )]
 enum Command {
-    #[command(description = "Start.")]
+    #[command(description = "Начало работы с ботом.")]
     Start,
-    #[command(description = "Help.")]
+    #[command(description = "Вывод списка всех команд.")]
     Help,
-    Test,
+    #[command(description = "Редактирование параметров.")]
     Edit {
         parameter: String,
     },
+    #[command(description = "Посмотреть параметры пользователя.")]
+    Info
 }
 
 type MyDialogue = Dialogue<State, InMemStorage<State>>;
@@ -83,33 +85,23 @@ async fn main() {
         }
     }
 
-    let USERS = Arc::new(Mutex::new(Vec::new()));
-
     let pool = SqlitePool::connect(DB_URL).await.unwrap();
     init_db(&pool).await;
-    let users = get_all_users(&pool).await;
-    match users {
-        Some(users) => {
-            for user in users {
-                USERS.lock().unwrap().push(user);
-            }
-        }
-        None => (),
-    }
 
     let timers = tokio::task::spawn({
         let bot = bot.clone();
-        let USERS = USERS.clone();
+        let pool = pool.clone();
 
         async move {
             let mut interval = time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                let users = USERS.lock().unwrap().clone();
+                // let users = USERS.lock().unwrap().clone();
+                let users = get_all_users(&pool).await.unwrap();
                 let now = Local::now().time();
                 for user in users {
                     let diff = (now - user.notification_time).num_minutes();
-                    if diff == 0 {
+                    if diff == 0 && now > user.notification_time {
                         let events = get_events(user.city, user.tags, user.events_interval).await;
                         let mut total = events.len();
                         let mut offset = 0;
@@ -118,7 +110,7 @@ async fn main() {
                             let mut output = String::new();
                             for event in &events[offset..offset + step] {
                                 output = format!(
-                                    "{output}{}\nhttps://afisha.yandex.ru/{}/n",
+                                    "{output}\n{}\nhttps://afisha.yandex.ru/{}/n",
                                     event.title, event.url
                                 );
                             }
@@ -135,7 +127,7 @@ async fn main() {
     });
 
     Dispatcher::builder(bot, schema())
-        .dependencies(dptree::deps![InMemStorage::<State>::new(), pool, USERS])
+        .dependencies(dptree::deps![InMemStorage::<State>::new(), pool])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -150,7 +142,7 @@ fn schema() -> UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'static>>
         case![State::Start]
             .branch(case![Command::Help].endpoint(cmd_help))
             .branch(case![Command::Start].endpoint(cmd_start))
-            .branch(case![Command::Test].endpoint(cmd_test))
+            .branch(case![Command::Info].endpoint(cmd_info))
             .branch(case![Command::Edit { parameter }].endpoint(cmd_edit)),
     );
     let message_handler = Update::filter_message()
@@ -180,55 +172,35 @@ async fn cmd_cancel(bot: Bot, msg: Message, dialogue: MyDialogue) -> HandlerResu
     Ok(())
 }
 
-async fn cmd_test(bot: Bot, msg: Message) -> HandlerResult {
-    bot.send_message(msg.chat.id, "https://youtube.com").await?;
-    Ok(())
-}
-
 async fn cmd_help(bot: Bot, msg: Message) -> HandlerResult {
     bot.send_message(msg.chat.id, Command::descriptions().to_string())
         .await?;
     Ok(())
 }
 
+async fn cmd_info(bot: Bot, msg: Message, pool: SqlitePool) -> HandlerResult {
+    let user = get_user(&pool, msg.chat.id.0 as u64).await.unwrap();
+    let tg_id = user.tg_id;
+    let city = user.city;
+    let categories = user.tags;
+    let categories_to_print = categories.join(" ");
+    let notification_time = user.notification_time;
+    let events_interval = user.events_interval;
+    bot.send_message(
+        msg.chat.id,
+        format!(
+            "Вы выбрали\nВаше id: {tg_id}\nВаш город: {city}\nКатегории: {categories_to_print}\nВремя оповещений: {notification_time}\nИнтервал предстоящих событий: {events_interval}"
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn cmd_start(
     bot: Bot,
     dialogue: MyDialogue,
-    msg: Message,
-    pool: SqlitePool,
-    USERS: Arc<Mutex<Vec<User>>>,
+    msg: Message
 ) -> HandlerResult {
-    let id = msg.from().unwrap().id.0;
-    let user = get_user(&pool, id).await;
-    match user {
-        Some(user) => {
-            {
-                USERS.lock().unwrap().push(user.clone())
-            }
-            bot.send_message(
-                msg.chat.id,
-                format!(
-                    "
-                Вы выбрали\n
-                Ваше id: {}\n
-                Ваш город: {}\n
-                Категории: {}\n
-                Время оповещений: {}\n
-                Интервал предстоящих событий: {}
-                ",
-                    user.tg_id,
-                    user.city,
-                    user.tags.join(" "),
-                    user.notification_time,
-                    user.events_interval
-                ),
-            )
-            .await?;
-            dialogue.update(State::Start).await?;
-            return Ok(());
-        }
-        None => {}
-    }
     bot.send_message(msg.chat.id, "Давайте начнем! Из какого вы города?")
         .await?;
     dialogue.update(State::City).await?;
@@ -280,7 +252,6 @@ async fn receive_edit_city(
     bot: Bot,
     dialogue: MyDialogue,
     msg: Message,
-    USERS: Arc<Mutex<Vec<User>>>,
     pool: SqlitePool,
 ) -> HandlerResult {
     match msg.text() {
@@ -288,13 +259,6 @@ async fn receive_edit_city(
             if text == "/cancel" {
                 cmd_cancel(bot, msg, dialogue).await?;
                 return Ok(());
-            }
-            let mut old_user = User::default();
-            for user in USERS.lock().unwrap().iter_mut() {
-                if user.tg_id == msg.chat.id.0 as u64 {
-                    user.city = text.into();
-                    old_user = user.clone();
-                }
             }
             update_user(
                 &pool,
@@ -306,10 +270,11 @@ async fn receive_edit_city(
                     notification_time: None,
                     events_interval: None,
                 },
-                old_user     
+                msg.chat.id.0 as u64     
             )
             .await
             .unwrap();
+            dialogue.exit().await?;
         }
         None => {
             bot.send_message(msg.chat.id, "Отправьте ваш город.")
@@ -323,7 +288,6 @@ async fn receive_edit_categories(
     bot: Bot,
     dialogue: MyDialogue,
     msg: Message,
-    USERS: Arc<Mutex<Vec<User>>>,
     pool: SqlitePool,
 ) -> HandlerResult {
     match msg.text() {
@@ -348,13 +312,6 @@ async fn receive_edit_categories(
                 };
                 categories.push(part.to_string());
             }
-            let mut old_user = User::default();
-            for user in USERS.lock().unwrap().iter_mut() {
-                if user.tg_id == msg.chat.id.0 as u64 {
-                    user.tags = categories.clone();
-                    old_user = user.clone();
-                }
-            }
             update_user(
                 &pool,
                 UserFilter {
@@ -365,10 +322,11 @@ async fn receive_edit_categories(
                     notification_time: None,
                     events_interval: None,
                 },
-                old_user     
+                msg.chat.id.0 as u64     
             )
             .await
             .unwrap();
+            dialogue.exit().await?;
         }
         None => {
             bot.send_message(msg.chat.id, "Отправьте ваш город.")
@@ -382,7 +340,6 @@ async fn receive_edit_notification_time(
     bot: Bot,
     dialogue: MyDialogue,
     msg: Message,
-    USERS: Arc<Mutex<Vec<User>>>,
     pool: SqlitePool,
 ) -> HandlerResult {
     match msg.text() {
@@ -392,19 +349,26 @@ async fn receive_edit_notification_time(
                 return Ok(());
             }
             let parts: Vec<&str> = text.split(':').collect();
+            let hour = match parts[0].parse::<u32>() {
+                Ok(num) => num,
+                Err(_) => {
+                    dialogue.update(State::EditNotificationTime).await?;
+                    return Ok(())
+                },
+            };
+            let min = match parts[1].parse::<u32>() {
+                Ok(num) => num,
+                Err(_) => {
+                    dialogue.update(State::EditNotificationTime).await?;
+                    return Ok(())
+                },
+            };
             let notification_time = NaiveTime::from_hms_opt(
-                parts[0].parse::<u32>().unwrap(),
-                parts[1].parse::<u32>().unwrap(),
+                hour,
+                min,
                 0,
             )
             .unwrap();
-            let mut old_user = User::default();
-            for user in USERS.lock().unwrap().iter_mut() {
-                if user.tg_id == msg.chat.id.0 as u64 {
-                    user.notification_time = notification_time;
-                    old_user = user.clone();
-                }
-            }
             update_user(
                 &pool,
                 UserFilter {
@@ -415,10 +379,11 @@ async fn receive_edit_notification_time(
                     notification_time: Some(notification_time),
                     events_interval: None,
                 },
-                old_user     
+                msg.chat.id.0 as u64     
             )
             .await
             .unwrap();
+            dialogue.exit().await?;
         }
         None => {
             bot.send_message(msg.chat.id, "Отправьте ваш город.")
@@ -432,7 +397,6 @@ async fn receive_edit_events_interval(
     bot: Bot,
     dialogue: MyDialogue,
     msg: Message,
-    USERS: Arc<Mutex<Vec<User>>>,
     pool: SqlitePool,
 ) -> HandlerResult {
     match msg.text() {
@@ -441,14 +405,7 @@ async fn receive_edit_events_interval(
                 cmd_cancel(bot, msg, dialogue).await?;
                 return Ok(());
             }
-            let mut old_user = User::default();
             let events_interval = text.parse::<u32>().unwrap();
-            for user in USERS.lock().unwrap().iter_mut() {
-                if user.tg_id == msg.chat.id.0 as u64 {
-                    user.events_interval = events_interval;
-                    old_user = user.clone();
-                }
-            }
             update_user(
                 &pool,
                 UserFilter {
@@ -459,10 +416,11 @@ async fn receive_edit_events_interval(
                     notification_time: None,
                     events_interval: Some(events_interval),
                 },
-                old_user     
+                msg.chat.id.0 as u64 
             )
             .await
             .unwrap();
+            dialogue.exit().await?;
         }
         None => {
             bot.send_message(msg.chat.id, "Отправьте ваш город.")
@@ -561,9 +519,23 @@ async fn receive_notification_time(
             .await?;
             //input example 22:10
             let parts: Vec<&str> = text.split(':').collect();
+            let hour = match parts[0].parse::<u32>() {
+                Ok(num) => num,
+                Err(_) => {
+                    dialogue.update(State::EditNotificationTime).await?;
+                    return Ok(())
+                },
+            };
+            let min = match parts[1].parse::<u32>() {
+                Ok(num) => num,
+                Err(_) => {
+                    dialogue.update(State::EditNotificationTime).await?;
+                    return Ok(())
+                },
+            };
             let naive_time = NaiveTime::from_hms_opt(
-                parts[0].parse::<u32>().unwrap(),
-                parts[1].parse::<u32>().unwrap(),
+                hour,
+                min,
                 0,
             )
             .unwrap();
@@ -589,7 +561,6 @@ async fn receive_events_interval(
     (city, categories, notification_time): (String, Vec<String>, NaiveTime),
     msg: Message,
     pool: SqlitePool,
-    USERS: Arc<Mutex<Vec<User>>>,
 ) -> HandlerResult {
     match msg.text() {
         Some(text) => {
@@ -618,9 +589,6 @@ async fn receive_events_interval(
                 events_interval: events_interval,
             };
             insert_user(&pool, user.clone()).await;
-            {
-                USERS.lock().unwrap().push(user);
-            }
         }
         None => {
             bot.send_message(msg.chat.id, "Send me categories.").await?;
